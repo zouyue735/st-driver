@@ -1,0 +1,20 @@
+{
+  "name": "st-driver",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Modular SillyTavern driver: full HTTP API coverage + browser UI control (generation, STscript, personas), driven by external agents.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test-concurrency=1 --test \"tests/core/*.test.js\" \"tests/api/*.test.js\" \"tests/ui/*.test.js\" \"tests/integration/*.test.js\"",
+    "test:core": "node --test-concurrency=1 --test \"tests/core/*.test.js\"",
+    "test:api": "node --test-concurrency=1 --test \"tests/api/*.test.js\"",
+    "test:ui": "node --test-concurrency=1 --test \"tests/ui/*.test.js\"",
+    "test:integration": "node --test-concurrency=1 --test \"tests/integration/*.test.js\""
+  },
+  "dependencies": {
+    "playwright-core": "^1.55.0"
+  }
+}
