@@ -115,12 +115,58 @@ node src/cli.js ui state
 For multi-step UI work keep one `UiSession` open programmatically instead of
 paying the browser launch per call.
 
+### instance track — start/stop local SillyTavern checkouts
+
+Two named environments ship preconfigured (override with `ST_INSTANCE_TEST` /
+`ST_INSTANCE_PROD`, or pass any path in place of the env name):
+
+| env | root |
+|---|---|
+| `test` | `C:/Users/zouyue/SillyTavern/test/SillyTavern` |
+| `prod` | `C:/Users/zouyue/SillyTavern/prod/SillyTavern` |
+
+```bash
+node src/cli.js instance list                       # status of both envs
+node src/cli.js instance status test
+node src/cli.js instance start test                 # detached, waits until HTTP is up
+node src/cli.js instance start prod --json '{"port":8001}'   # prod alongside test
+node src/cli.js instance stop test
+node src/cli.js instance restart test
+node src/cli.js instance logs test --json '{"lines":80}'
+```
+
+Programmatic: `import { InstanceManager } from '<skill>/src/index.js'` then
+`await new InstanceManager().start('test', { port: 8001, force: true })`.
+
+Behavior worth knowing before you use it:
+
+- **Logs**: each start writes `<skill>/logs/st-<env>-<YYYY-MM-DD_HH-mm-ss>.log`
+  with a banner (time, root, full command, port, node version), then merged
+  stdout+stderr. `logs/<env>.pid` records the pid. `logs/` is gitignored.
+- **Detached**: the server survives the CLI process exiting.
+- **Both envs default to port 8000**, so they cannot run simultaneously unless
+  one is given `--json '{"port":N}'`.
+- **Pre-flight**: refuses to start when `server.js` or `node_modules` is missing
+  (tells you the exact `npm install` command), and refuses when the target port
+  is already held by another process.
+- **`stop` only touches what this manager started.** For an instance launched
+  manually, pass `--json '{"adoptPortOwner":true}'`; it never guesses, because
+  killing the wrong process is unrecoverable.
+- **Windows has no real SIGTERM** — `stop` is effectively a hard kill, so ST gets
+  no chance to flush pending debounced saves. Don't stop an instance immediately
+  after a generation; give it a couple of seconds.
+- **`status` distinguishes "port answered" from "this env answered"**: since both
+  envs share port 8000, `http.up: true` alone does not tell you which instance
+  replied — check `portOwnerMatches` (true only when the port owner IS this env's
+  recorded pid).
+
 ## Module map
 
 ### Core (`src/core/`)
 - `client.js` — `STClient`: CSRF+cookie auth, JSON/text/binary/multipart POST, `StApiError`.
 - `browser.js` — `StBrowser`: launches system Edge/Chrome, waits for APP_READY, evaluate helpers, generation-idle detection.
 - `stscript.js` — `StscriptBridge`: run any STscript, strict mode, command-registry dump, event subscribe/poll.
+- `instance.js` — `InstanceManager`: start/stop/restart/status local ST checkouts by named env (`test`/`prod`/path), detached background process, timestamped merged stdout+stderr log, HTTP readiness wait. See "Instance management" below.
 
 ### HTTP API (`src/api/`) — each class takes an `STClient`
 - `characters.js` — `CharactersApi`: all/get/create/edit/editAttribute/editAvatar/mergeAttributes/rename/duplicate/delete/chats/export/import

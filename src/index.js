@@ -14,8 +14,12 @@ import { STClient, StApiError } from './core/client.js';
 import { StBrowser, findBrowserExecutable } from './core/browser.js';
 import { StscriptBridge } from './core/stscript.js';
 import { UiSession } from './ui/session.js';
+import { InstanceManager, InstanceError, DEFAULT_INSTANCES, LOG_DIR } from './core/instance.js';
 
-export { STClient, StApiError, StBrowser, StscriptBridge, UiSession, findBrowserExecutable };
+export {
+    STClient, StApiError, StBrowser, StscriptBridge, UiSession, findBrowserExecutable,
+    InstanceManager, InstanceError, DEFAULT_INSTANCES, LOG_DIR,
+};
 
 /** Registry of API modules: property name on `st.api` -> module path + export name. */
 const API_MODULES = {

@@ -3,3 +3,5 @@ node_modules/
 .env
 tmp/
 test-artifacts/
+# instance runtime state: launch logs and pid files (see src/core/instance.js)
+logs/

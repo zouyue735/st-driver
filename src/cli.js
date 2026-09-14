@@ -27,6 +27,7 @@
  * Output: JSON on stdout (result or {error}); non-zero exit on failure.
  */
 import { createStDriver, createUiDriver, STClient } from './index.js';
+import { InstanceManager, InstanceError } from './core/instance.js';
 
 const BASE_URL = process.env.ST_URL ?? 'http://localhost:8000';
 
@@ -363,6 +364,88 @@ async function runUi(command, jsonArg, options) {
 
 // ---------------------------------------------------------------------------
 
+/**
+ * `instance` track: manage local SillyTavern instances (start/stop/restart/status/logs).
+ *
+ * @param {string|undefined} action start|stop|restart|status|logs|list
+ * @param {string|undefined} env instance name (test|prod) or a path
+ * @param {object} jsonArg {port, dataRoot, listen, force, lines, wait, ...}
+ * @param {object} options CLI options
+ */
+async function runInstance(action, env, jsonArg, options) {
+    const manager = new InstanceManager();
+
+    if (!action) {
+        fail('instance track needs an action: start|stop|restart|status|logs|list', {
+            knownInstances: manager.names(),
+        });
+    }
+
+    switch (action) {
+        case 'list': {
+            const out = { logDir: manager.logDir, instances: {} };
+            for (const name of manager.names()) {
+                out.instances[name] = await manager.status(name, { port: jsonArg.port });
+            }
+            printJson(out);
+            break;
+        }
+        case 'status': {
+            if (!env) fail('instance status needs <env> (e.g. test, prod)');
+            printJson(await manager.status(env, { port: jsonArg.port }));
+            break;
+        }
+        case 'start': {
+            if (!env) fail('instance start needs <env> (e.g. test, prod)');
+            const result = await manager.start(env, {
+                port: jsonArg.port,
+                dataRoot: jsonArg.dataRoot,
+                listen: jsonArg.listen,
+                force: jsonArg.force,
+                wait: jsonArg.wait,
+                waitTimeout: jsonArg.waitTimeout ?? options.timeout,
+                args: jsonArg.args,
+            });
+            printJson(result);
+            break;
+        }
+        case 'stop': {
+            if (!env) fail('instance stop needs <env> (e.g. test, prod)');
+            printJson(await manager.stop(env, {
+                force: jsonArg.force,
+                gracefulTimeout: jsonArg.gracefulTimeout,
+                adoptPortOwner: jsonArg.adoptPortOwner,
+                port: jsonArg.port,
+            }));
+            break;
+        }
+        case 'restart': {
+            if (!env) fail('instance restart needs <env> (e.g. test, prod)');
+            const result = await manager.restart(env, {
+                port: jsonArg.port,
+                dataRoot: jsonArg.dataRoot,
+                listen: jsonArg.listen,
+                wait: jsonArg.wait,
+                waitTimeout: jsonArg.waitTimeout ?? options.timeout,
+                args: jsonArg.args,
+            });
+            printJson(result);
+            break;
+        }
+        case 'logs': {
+            if (!env) fail('instance logs needs <env> (e.g. test, prod)');
+            const { logFile, lines } = manager.tailLog(env, { lines: jsonArg.lines });
+            if (!logFile) fail(`no log file found for instance '${env}'`, { logDir: manager.logDir });
+            // human-readable tail, since that is the point of this command
+            console.log(`# ${logFile}`);
+            console.log(lines.join('\n'));
+            break;
+        }
+        default:
+            fail(`unknown instance action: ${action} (expected start|stop|restart|status|logs|list)`);
+    }
+}
+
 async function listAll() {
     const out = { tracks: {} };
     const st = await createStDriver({ baseUrl: BASE_URL }).catch(() => null);
@@ -394,6 +477,23 @@ async function listAll() {
         cliCommands: ['commands', 'stscript', 'state', 'characters', 'open-character',
             'read-chat', 'send', 'generate', 'connect', 'connection', 'sampling', 'persona', 'groups'],
     };
+    // instance track: named environments + their recorded runtime state (no HTTP
+    // probing here, so `list` stays fast and works while nothing is running)
+    const manager = new InstanceManager();
+    out.tracks.instance = {
+        actions: ['start', 'stop', 'restart', 'status', 'logs', 'list'],
+        logDir: manager.logDir,
+        environments: Object.fromEntries(
+            manager.names().map(name => [name, {
+                root: manager.resolveRoot(name),
+                pid: manager.readPid(name),
+                running: (() => {
+                    const pid = manager.readPid(name);
+                    return pid !== null && manager.isPidAlive(pid);
+                })(),
+            }]),
+        ),
+    };
     printJson(out);
 }
 
@@ -407,6 +507,27 @@ Usage:
   node src/cli.js api <module>.<method> [--json '<args>']
   node src/cli.js ui <command> [--json '<args>']
   node src/cli.js raw <GET|POST> <path> [--json '<body>']
+  node src/cli.js instance <action> [env] [--json '<args>']
+
+Instance management (start/stop local SillyTavern checkouts):
+  instance list                     status of every known env
+  instance status <env>             one env (test|prod|<path>)
+  instance start <env> [--json '{"port":8000,"force":true,"dataRoot":"...","listen":false,"wait":true,"waitTimeout":60000}']
+  instance stop <env> [--json '{"force":false,"gracefulTimeout":5000,"adoptPortOwner":false,"port":8000}']
+  instance restart <env> [--json '{...same as start}']
+  instance logs <env> [--json '{"lines":80}']   tail the newest launch log
+
+  stop only acts on instances this manager started (it tracks them via
+  logs/<env>.pid). If an instance was started manually, pass
+  adoptPortOwner:true to stop whatever process holds the port - it will NOT
+  guess otherwise, since that could kill an unrelated process.
+
+  Each start writes <repo>/logs/st-<env>-<timestamp>.log (stdout+stderr merged,
+  launch banner with time/root/command/port) and records logs/<env>.pid.
+  Default envs: test=C:/Users/zouyue/SillyTavern/test/SillyTavern,
+                prod=C:/Users/zouyue/SillyTavern/prod/SillyTavern
+  (override with ST_INSTANCE_TEST / ST_INSTANCE_PROD, or pass a path as <env>).
+  Both default to port 8000 - they cannot run at once without --json '{"port":N}'.
 
 Options:
   --url <baseUrl>      ST server (default $ST_URL or http://localhost:8000)
@@ -441,8 +562,13 @@ Run 'node src/cli.js list' for the full command surface.`);
             await runRaw(method, path, jsonArg, options);
             break;
         }
+        case 'instance': {
+            // argv layout: instance <action> [env] -> _[1]=action, _[2]=env
+            await runInstance(options._[1], options._[2], jsonArg, options);
+            break;
+        }
         default:
-            fail(`unknown track: ${track} (expected api|ui|raw|list)`);
+            fail(`unknown track: ${track} (expected api|ui|raw|instance|list)`);
     }
 }
 
