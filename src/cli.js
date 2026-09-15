@@ -28,6 +28,7 @@
  */
 import { createStDriver, createUiDriver, STClient } from './index.js';
 import { InstanceManager, InstanceError } from './core/instance.js';
+import { Cleaner, DEFAULT_SCOPE } from './core/cleaner.js';
 
 const BASE_URL = process.env.ST_URL ?? 'http://localhost:8000';
 
@@ -446,6 +447,90 @@ async function runInstance(action, env, jsonArg, options) {
     }
 }
 
+/**
+ * `clean` track: bulk-delete characters / group chats / world info / chat logs.
+ *
+ * Destructive by design, so the CLI is deliberately two-step:
+ *   node src/cli.js clean test                       -> PLAN ONLY (nothing deleted)
+ *   node src/cli.js clean test --json '{"confirm":true}'  -> actually delete
+ *
+ * @param {string|undefined} env optional instance name (test|prod|path) used to
+ *   resolve AND verify the target; otherwise --url / $ST_URL is used
+ * @param {object} jsonArg {confirm, scope:{characters,groups,worldinfo,chats,settings},
+ *   protect:[], requirePrefix, showItems}
+ * @param {object} options CLI options (--url, --timeout)
+ */
+async function runClean(env, jsonArg, options) {
+    // Resolve the target base URL. Naming an env is the safe path: we can then
+    // verify something is actually listening there before deleting anything.
+    let baseUrl = options.url ?? BASE_URL;
+    let resolvedFrom = options.url ? '--url' : '$ST_URL/default';
+
+    if (env) {
+        const manager = new InstanceManager();
+        let root;
+        try {
+            root = manager.resolveRoot(env);
+        } catch (e) {
+            fail(e?.message ?? String(e));
+        }
+        const st = await manager.status(env, { port: jsonArg.port });
+        baseUrl = `http://localhost:${st.port}`;
+        resolvedFrom = `instance '${env}' (port ${st.port} from ${st.portSource})`;
+        if (!st.http.up) {
+            fail(`cannot clean: nothing is answering ${baseUrl} for instance '${env}' (root ${root}). ` +
+                `Start it first: node src/cli.js instance start ${env}` +
+                (st.port ? ` --json '{"port":${st.port}}'` : ''), { status: st });
+        }
+    }
+
+    const client = new STClient({ baseUrl, timeout: options.timeout });
+    try {
+        await client.connect();
+    } catch (e) {
+        fail(`cannot reach ${baseUrl}: ${e?.message ?? e}`);
+    }
+
+    const cleaner = new Cleaner({ client });
+    const cleanOptions = {
+        confirm: jsonArg.confirm === true,
+        scope: jsonArg.scope ?? undefined,
+        protect: jsonArg.protect ?? [],
+        requirePrefix: jsonArg.requirePrefix ?? undefined,
+    };
+
+    const report = await cleaner.clean(cleanOptions);
+
+    // Summarize rather than dumping a possibly huge item list. showItems > 0
+    // caps the list; showItems <= 0 means "all" (the truncation note below
+    // advertises exactly that, so `slice(0, 0)` would have contradicted it).
+    // Absent -> 25.
+    const requested = jsonArg.showItems;
+    const limit = Number.isInteger(requested)
+        ? (requested > 0 ? requested : report.items.length)
+        : 25;
+    const out = {
+        target: baseUrl,
+        resolvedFrom,
+        scope: { ...DEFAULT_SCOPE, ...(cleanOptions.scope ?? {}) },
+        dryRun: report.dryRun,
+        confirmed: report.confirmed,
+        planned: report.planned,
+        deleted: report.deleted,
+        protected: report.protected_,
+        failures: report.failures,
+        notes: report.notes,
+        itemsShown: Math.min(limit, report.items.length),
+        itemsTotal: report.items.length,
+        items: report.items.slice(0, limit),
+    };
+    if (report.items.length > limit) {
+        out.itemsTruncated = `${report.items.length - limit} more not shown (pass --json '{"showItems":0}' for all)`;
+    }
+    printJson(out);
+    await client.close();
+}
+
 async function listAll() {
     const out = { tracks: {} };
     const st = await createStDriver({ baseUrl: BASE_URL }).catch(() => null);
@@ -494,6 +579,18 @@ async function listAll() {
             }]),
         ),
     };
+    out.tracks.clean = {
+        note: 'DESTRUCTIVE bulk wipe; defaults to PLAN ONLY (pass confirm:true to delete)',
+        scopes: Object.keys(DEFAULT_SCOPE),
+        defaultScope: DEFAULT_SCOPE,
+        options: {
+            confirm: 'MUST be exactly true to delete anything; omitted/false -> dry run',
+            scope: 'which kinds to wipe; settings is opt-in (only path that rewrites settings.json)',
+            protect: 'names/prefixes to exclude; protecting a character also protects its chat logs',
+            requirePrefix: 'fail-closed guard: aborts (E_CLEAN_PREFIX_VIOLATION) unless EVERY target starts with it',
+            showItems: 'CLI only: cap the item list (default 25; <=0 = all)',
+        },
+    };
     printJson(out);
 }
 
@@ -508,6 +605,7 @@ Usage:
   node src/cli.js ui <command> [--json '<args>']
   node src/cli.js raw <GET|POST> <path> [--json '<body>']
   node src/cli.js instance <action> [env] [--json '<args>']
+  node src/cli.js clean [env] [--json '<args>']
 
 Instance management (start/stop local SillyTavern checkouts):
   instance list                     status of every known env
@@ -528,6 +626,25 @@ Instance management (start/stop local SillyTavern checkouts):
                 prod=C:/Users/zouyue/SillyTavern/prod/SillyTavern
   (override with ST_INSTANCE_TEST / ST_INSTANCE_PROD, or pass a path as <env>).
   Both default to port 8000 - they cannot run at once without --json '{"port":N}'.
+
+Bulk content wipe (DESTRUCTIVE - characters, group chats, world info, chat logs):
+  clean <env>                          PLAN ONLY, deletes nothing (default)
+  clean <env> --json '{"confirm":true}'                 actually delete everything
+  clean <env> --json '{"protect":["MyChar","向日葵"],"confirm":true}'  keep those (exact name or prefix)
+  clean <env> --json '{"scope":{"characters":true,"groups":true,"worldinfo":false,"chats":true}}'
+  clean <env> --json '{"scope":{"settings":true},"confirm":true}'      also clear active_character/active_group/tag_map
+  clean <env> --json '{"requirePrefix":"__drvtest_","confirm":true}'   guard: abort unless EVERY target starts with it
+  clean <env> --json '{"showItems":0}'            list all items (default cap 25; <=0 = all)
+
+  Order: groups (cascades their group chats) -> characters (deleteChats) ->
+  leftover chat logs of kept characters -> world info. scope.settings is OFF by
+  default; it is the only path that rewrites settings.json.
+  protect on a character protects its chat logs too; to wipe all logs but keep
+  every card use scope:{"characters":false} with no protect list. Protect groups
+  by BOTH name and id. requirePrefix is a fail-closed guard independent of
+  protect: use it whenever the instance holds real content.
+  Without <env> the --url / $ST_URL target is used and is NOT verified - prefer
+  naming the instance so the driver checks it is actually up first.
 
 Options:
   --url <baseUrl>      ST server (default $ST_URL or http://localhost:8000)
@@ -567,8 +684,13 @@ Run 'node src/cli.js list' for the full command surface.`);
             await runInstance(options._[1], options._[2], jsonArg, options);
             break;
         }
+        case 'clean': {
+            // argv layout: clean [env] -> _[1]=env (optional)
+            await runClean(options._[1], jsonArg, options);
+            break;
+        }
         default:
-            fail(`unknown track: ${track} (expected api|ui|raw|instance|list)`);
+            fail(`unknown track: ${track} (expected api|ui|raw|instance|clean|list)`);
     }
 }
 

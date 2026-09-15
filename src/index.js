@@ -15,10 +15,12 @@ import { StBrowser, findBrowserExecutable } from './core/browser.js';
 import { StscriptBridge } from './core/stscript.js';
 import { UiSession } from './ui/session.js';
 import { InstanceManager, InstanceError, DEFAULT_INSTANCES, LOG_DIR } from './core/instance.js';
+import { Cleaner, DEFAULT_SCOPE } from './core/cleaner.js';
 
 export {
     STClient, StApiError, StBrowser, StscriptBridge, UiSession, findBrowserExecutable,
     InstanceManager, InstanceError, DEFAULT_INSTANCES, LOG_DIR,
+    Cleaner, DEFAULT_SCOPE,
 };
 
 /** Registry of API modules: property name on `st.api` -> module path + export name. */

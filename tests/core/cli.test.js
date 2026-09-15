@@ -283,6 +283,183 @@ describe('CLI: ui track (headless browser)', { timeout: 180_000 }, () => {
     });
 });
 
+describe('CLI: clean track', { timeout: 180_000 }, () => {
+    // These run against the live instance, which may hold real user content.
+    // Every confirm:true call therefore also passes requirePrefix so the run
+    // aborts rather than touching anything outside the fixture namespace.
+    const P = '__drvtest_';
+
+    test('clean with no args is a dry run and deletes nothing', () => {
+        const before = run(['api', 'characters.all']);
+        const r = run(['clean', '--json', '{"showItems":0}']);
+        assert.equal(r.status, 0, r.stderr);
+        assert.equal(r.json.dryRun, true);
+        assert.equal(r.json.confirmed, false);
+        assert.deepEqual(r.json.deleted, { characters: 0, groups: 0, worldinfo: 0, chats: 0, settings: 0 });
+        assert.ok(r.json.notes.some(n => n.includes('NOTHING WAS DELETED')));
+        const after = run(['api', 'characters.all']);
+        assert.equal(after.json.length, before.json.length, 'character count must be unchanged');
+    });
+
+    test('clean reports planned counts and the resolved scope', () => {
+        const r = run(['clean', '--json', '{"showItems":0}']);
+        assert.equal(r.status, 0, r.stderr);
+        assert.ok(r.json.planned, 'planned present');
+        for (const k of ['characters', 'groups', 'worldinfo', 'chats']) {
+            assert.equal(typeof r.json.planned[k], 'number');
+        }
+        assert.deepEqual(Object.keys(r.json.scope).sort(), ['characters', 'chats', 'groups', 'settings', 'worldinfo']);
+        assert.equal(r.json.scope.settings, false, 'settings is opt-in');
+    });
+
+    test('clean honours a scope subset', () => {
+        const r = run(['clean', '--json', '{"scope":{"worldinfo":false,"groups":false},"showItems":0}']);
+        assert.equal(r.status, 0, r.stderr);
+        assert.equal(r.json.scope.worldinfo, false);
+        assert.equal(r.json.scope.groups, false);
+        assert.equal(r.json.planned.worldinfo, 0);
+        assert.equal(r.json.planned.groups, 0);
+    });
+
+    test('clean protect excludes matching entries and lists them', async () => {
+        // Create a fixture, then protect its prefix: it must drop out of `planned`
+        // and show up in `protected` instead. Instance-agnostic - it does not
+        // assume anything about what else is on the server.
+        const name = `${P}prot_${Date.now().toString(36)}`;
+        const created = run(['api', 'characters.create', '--json',
+            JSON.stringify({ ch_name: name, description: 'd', first_mes: 'hi' })]);
+        assert.equal(created.status, 0, created.stderr);
+        try {
+            const open = run(['clean', '--json', '{"showItems":0}']);
+            const guarded = run(['clean', '--json', JSON.stringify({ protect: [name], showItems: 0 })]);
+            assert.equal(guarded.status, 0, guarded.stderr);
+            assert.equal(guarded.json.planned.characters, open.json.planned.characters - 1,
+                'protecting the fixture must remove exactly it from the plan');
+            assert.ok(guarded.json.protected.some(s => s.includes(name)), 'and report it as protected');
+        } finally {
+            run(['api', 'characters.delete', '--json', JSON.stringify([`${name}.png`, { deleteChats: true }])]);
+        }
+    });
+
+    test('clean truncates the item list and says so', () => {
+        const r = run(['clean', '--json', '{"showItems":1}']);
+        assert.equal(r.status, 0, r.stderr);
+        assert.ok(r.json.items.length <= 1);
+        assert.equal(r.json.itemsShown, r.json.items.length);
+        assert.equal(typeof r.json.itemsTotal, 'number');
+        if (r.json.itemsTotal > 1) {
+            assert.match(r.json.itemsTruncated, /more not shown/);
+        }
+    });
+
+    test('clean showItems:0 lists everything', () => {
+        const r = run(['clean', '--json', '{"showItems":0}']);
+        assert.equal(r.status, 0, r.stderr);
+        assert.equal(r.json.items.length, r.json.itemsTotal);
+        assert.equal(r.json.itemsShown, r.json.itemsTotal);
+        assert.equal(r.json.itemsTruncated, undefined,
+            'no truncation note when everything is shown');
+    });
+
+    test('clean a negative showItems also means "all"', () => {
+        const r = run(['clean', '--json', '{"showItems":-1}']);
+        assert.equal(r.status, 0, r.stderr);
+        assert.equal(r.json.items.length, r.json.itemsTotal);
+    });
+
+    test('clean omits showItems -> defaults to 25', () => {
+        const r = run(['clean']);
+        assert.equal(r.status, 0, r.stderr);
+        assert.ok(r.json.items.length <= 25);
+        if (r.json.itemsTotal > 25) {
+            assert.match(r.json.itemsTruncated, /showItems":0/);
+        }
+    });
+
+    test('clean confirm:true + requirePrefix aborts on non-fixture content', () => {
+        // On an instance holding real content this must refuse; the exit code is
+        // non-zero and nothing is deleted.
+        const before = run(['api', 'characters.all']);
+        const r = run(['clean', '--json', `{"confirm":true,"requirePrefix":"${P}","showItems":0}`]);
+        const after = run(['api', 'characters.all']);
+        assert.equal(after.json.length, before.json.length, 'nothing may be deleted');
+        if (r.status !== 0) {
+            assert.match(r.json?.error ?? r.stderr, /E_CLEAN_PREFIX_VIOLATION|do not start with/);
+        }
+    });
+
+    test('clean deletes a fixture end to end through the CLI', () => {
+        // Create a fixture + a chat log via the API track, wipe via the clean
+        // track, confirm both gone. A protect list covering every non-fixture
+        // card (plus the requirePrefix guard) makes this safe on an instance that
+        // also holds real user content, and lets the run actually execute rather
+        // than abort.
+        const name = `${P}cli_${Date.now().toString(36)}`;
+        const avatar = `${name}.png`;
+
+        const allBefore = run(['api', 'characters.all']);
+        const protect = allBefore.json
+            .map(c => String(c.avatar))
+            .filter(a => a && !a.startsWith(P));
+        const worlds = run(['api', 'worldinfo.list']);
+        for (const w of worlds.json ?? []) {
+            const n = String(w.name ?? w.file_id ?? '');
+            if (n && !n.startsWith(P)) protect.push(n);
+        }
+        const groups = run(['api', 'groups.all']);
+        for (const g of groups.json ?? []) {
+            if (String(g.name ?? '').startsWith(P)) continue;
+            protect.push(String(g.name ?? ''), String(g.id ?? ''));
+        }
+
+        const created = run(['api', 'characters.create', '--json',
+            JSON.stringify({ ch_name: name, description: 'd', first_mes: 'hi' })]);
+        assert.equal(created.status, 0, created.stderr);
+        const saved = run(['api', 'chats.save', '--json', JSON.stringify({
+            avatarUrl: avatar,
+            fileName: `${name} - 1`,
+            chat: [{ user_name: 'You', character_name: name }, { name: 'You', is_user: true, mes: 'hi' }],
+        })]);
+        assert.equal(saved.status, 0, saved.stderr);
+
+        const arg = JSON.stringify({ confirm: true, protect, requirePrefix: P, showItems: 0 });
+        const dry = run(['clean', '--json', JSON.stringify({ ...JSON.parse(arg), confirm: false })]);
+        assert.equal(dry.status, 0, dry.stderr);
+        assert.equal(dry.json.planned.characters, 1, 'only the fixture is planned');
+        assert.equal(dry.json.planned.chats, 1, 'its single log is planned');
+
+        const r = run(['clean', '--json', arg]);
+        assert.equal(r.status, 0, `${r.stderr}\n${JSON.stringify(r.json)}`);
+        assert.equal(r.json.dryRun, false);
+        assert.equal(r.json.confirmed, true);
+        assert.equal(r.json.deleted.characters, 1, 'fixture card deleted');
+        assert.equal(r.json.deleted.chats, 1, 'fixture log counted');
+        assert.deepEqual(r.json.failures, []);
+
+        const after = run(['api', 'characters.all']);
+        assert.ok(!after.json.some(c => c.avatar === avatar), 'fixture card must be gone');
+        assert.equal(after.json.length, allBefore.json.length, 'real content untouched');
+    });
+
+    test('clean against a named instance that is not running fails with guidance', () => {
+        // 'prod' is a known env; if it happens to be running this asserts the
+        // shape instead of the failure, so only check the reported target.
+        const r = run(['clean', 'prod', '--json', '{"showItems":0}']);
+        if (r.status === 0) {
+            assert.match(r.json.resolvedFrom, /instance 'prod'/);
+        } else {
+            assert.match(r.json?.error ?? '', /cannot clean|nothing is answering|unknown instance/i);
+        }
+    });
+
+    test('clean with --url targets that url', () => {
+        const r = run(['clean', '--url', BASE_URL, '--json', '{"showItems":0}']);
+        assert.equal(r.status, 0, r.stderr);
+        assert.equal(r.json.target, BASE_URL);
+        assert.equal(r.json.resolvedFrom, '--url');
+    });
+});
+
 describe('CLI: unknown track', () => {
     test('an unknown track fails with guidance', () => {
         const r = run(['bogus', 'thing']);

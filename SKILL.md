@@ -165,13 +165,68 @@ Behavior worth knowing before you use it:
   replied — check `portOwnerMatches` (true only when the port owner IS this env's
   recorded pid).
 
+### clean track — bulk-delete world books / character cards / groups / chat logs
+
+```bash
+node src/cli.js clean test                                  # PLAN ONLY - deletes nothing
+node src/cli.js clean test --json '{"confirm":true}'        # actually delete everything
+node src/cli.js clean test --json '{"protect":["Main Hero","__p1_"]}'
+node src/cli.js clean test --json '{"scope":{"characters":false}}'   # logs only, keep all cards
+node src/cli.js clean prod --json '{"confirm":true,"scope":{"settings":true}}'
+node src/cli.js clean --url http://localhost:8000 --json '{"showItems":0}'
+```
+
+Programmatic: `new Cleaner({ client }).plan(opts)` / `.clean({ confirm: true, ...opts })`.
+
+Options: `confirm` (MUST be `true` to delete), `scope` (`characters`/`groups`/`worldinfo`/`chats`
+default on, `settings` off), `protect` (names or prefixes to exclude), `requirePrefix`
+(guardrail, below), `onProgress` (callback), and CLI-only `showItems` (cap the item
+list; `0` = all, default `25`).
+
+Safety rules — read these before running with `confirm:true`:
+
+- **Omitting `confirm` is always a dry run.** It returns the same `planned` counts a
+  confirmed run would act on, plus `NOTHING WAS DELETED` in `notes`.
+- **Deletion goes through the HTTP API, not the filesystem**, so ST's caches,
+  thumbnails and tag maps stay consistent.
+- **`protect` on a character protects its chat logs too.** Keeping a card while
+  silently wiping its 200 conversations would be a footgun. To keep every card but
+  wipe all logs, use `scope:{characters:false}` with NO protect list.
+- **`requirePrefix` is a fail-closed guardrail, independent of `protect`.** Every
+  planned target must start with that prefix or `clean()` throws
+  `E_CLEAN_PREFIX_VIOLATION` BEFORE deleting anything. Use it whenever the instance
+  also holds real content — it converts a protect-list bug from data loss into an
+  exception. (It earned its keep immediately: an early test suite protected
+  characters and worlds but forgot groups, and this guard aborted a real group
+  deletion instead of running it.)
+- **`protect` must cover groups by BOTH name and id.** A group's name can be
+  unrelated to its members, and `Cleaner` matches either. Protecting only the
+  character cards leaves the group — and its group-chat files — deletable.
+- Group deletion **cascades to its group-chat files** (verified in ST source
+  `src/endpoints/groups.js`), so groups are deleted first.
+- `deleted.chats` counts logs destroyed by cascade too, so it matches `planned.chats`
+  rather than reporting 0 after the card deletion swallowed them.
+- `scope.settings` is the ONLY path that rewrites settings.json: it clears
+  `active_character`/`active_group` and prunes `tag_map` keys whose card is gone.
+  Personas, `user_avatar` and `power_user.*` are deliberately never touched. Off by
+  default — stale pointers are harmless and guessing at user settings is not.
+- Failures are collected in `failures`, never thrown, so one undeletable item does not
+  abort the rest. Check `failures` is empty; a non-empty list means partial deletion.
+- Deleting is **irreversible**. `POST /api/characters/delete` is a plain `unlink`; there
+  is no trash. ST has **no on-demand backup endpoint** (`/api/backups/chat/*` only
+  lists/deletes/downloads the chat backups ST makes automatically), so if you need a
+  safety net, take one yourself before cleaning: copy the instance's
+  `data/default-user` directory, or export the cards you care about with
+  `api characters.export` / `api worldinfo.get`.
+
 ## Module map
 
 ### Core (`src/core/`)
 - `client.js` — `STClient`: CSRF+cookie auth, JSON/text/binary/multipart POST, `StApiError`.
 - `browser.js` — `StBrowser`: launches system Edge/Chrome, waits for APP_READY, evaluate helpers, generation-idle detection.
 - `stscript.js` — `StscriptBridge`: run any STscript, strict mode, command-registry dump, event subscribe/poll.
-- `instance.js` — `InstanceManager`: start/stop/restart/status local ST checkouts by named env (`test`/`prod`/path), detached background process, timestamped merged stdout+stderr log, HTTP readiness wait. See "Instance management" below.
+- `instance.js` — `InstanceManager`: start/stop/restart/status local ST checkouts by named env (`test`/`prod`/path), detached background process, timestamped merged stdout+stderr log, HTTP readiness wait. See "instance track" above.
+- `cleaner.js` — `Cleaner`: bulk-delete characters/groups/world info/chat logs with a mandatory `confirm`, a `protect` list and a fail-closed `requirePrefix` guard. See "clean track" above.
 
 ### HTTP API (`src/api/`) — each class takes an `STClient`
 - `characters.js` — `CharactersApi`: all/get/create/edit/editAttribute/editAvatar/mergeAttributes/rename/duplicate/delete/chats/export/import
