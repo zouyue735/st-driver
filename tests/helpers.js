@@ -39,6 +39,64 @@ export const LIVE_GEN = process.env.ST_DRIVER_LIVE_GEN === '1';
 export const LIVE_NET = process.env.ST_DRIVER_LIVE_NET === '1';
 
 /**
+ * Retry a flaky-by-nature operation (real-LLM generation) a few times.
+ *
+ * Why this exists: deepseek occasionally answers a non-streaming chat completion
+ * with `content: ''` + `finish_reason: 'stop'` (all output went into
+ * reasoning_content), and long non-streaming requests sometimes die with a
+ * socket AbortError (logged as "Error communicating with DeepSeek API"). Both
+ * are provider-side transients: the SAME driver code passed the same tests on
+ * immediate reruns (3x green after one red regression run, with the empty
+ * response captured in the ST log as evidence). The driver is REQUIRED to
+ * surface these as ok:false / empty text (behavior #17), so the tests must not
+ * treat a transient empty reply as a driver defect.
+ *
+ * Only use for live-generation assertions - never for deterministic API tests,
+ * where a failure is a real bug.
+ *
+ * @param {() => Promise<T>} fn
+ * @param {object} [options]
+ * @param {number} [options.attempts=3]
+ * @param {(error:unknown, attempt:number) => boolean} [options.shouldRetry]
+ *   decides whether a rejection is retryable (default: retry everything)
+ * @returns {Promise<T>}
+ */
+/**
+ * Decide whether a live-generation assertion failure is a TRANSIENT provider
+ * problem (retryable) rather than a driver defect (must fail loudly).
+ *
+ * Retryable signatures, all observed in the ST log during a real red run:
+ *   - `generation not ok` / `settledEmpty=true` / `lastMes=""` — deepseek
+ *     answered with empty `content` (output went to reasoning_content) or the
+ *     socket aborted mid-request.
+ *   - `gen must return generated text` — /gen's catch swallowed an AbortError
+ *     and returned ''.
+ * Anything else (e.g. "the user message must be persisted", "expected X to
+ * reply") is a structural assertion: a real bug that must NOT be retried away.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isTransientGenFailure(error) {
+    const msg = String(error?.message ?? error);
+    return /generation not ok|settledEmpty=true|lastMes=""|gen must return generated text|AbortError|operation was aborted/i.test(msg);
+}
+
+export async function withLiveGenRetry(fn, { attempts = 3, shouldRetry = isTransientGenFailure } = {}) {
+    let lastError;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+            return await fn();
+        } catch (e) {
+            lastError = e;
+            if (attempt === attempts || !shouldRetry(e, attempt)) throw e;
+            await new Promise(r => setTimeout(r, 2000 * attempt));
+        }
+    }
+    throw lastError;
+}
+
+/**
  * Resolve the on-disk user-data directory of the ST instance under test.
  *
  * A few tests assert server-side quirks at the FILESYSTEM level (e.g. "images/list

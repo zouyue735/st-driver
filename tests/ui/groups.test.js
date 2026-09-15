@@ -1,7 +1,7 @@
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { UiSession } from '../../src/ui/session.js';
-import { newClient, fixtureName, LIVE_GEN } from '../helpers.js';
+import { newClient, fixtureName, LIVE_GEN, withLiveGenRetry } from '../helpers.js';
 
 // Live integration tests for GroupControl (frontend group-chat operations).
 // Fixtures: two throwaway characters + one throwaway group, all HTTP-created
@@ -147,15 +147,20 @@ describe('GroupControl: directed generation (live LLM gated)', { timeout: TEST_T
             return SillyTavern.getContext().characters.findIndex(c => c.avatar === avatar);
         }, { avatar: chars[1].avatar });
         assert.ok(chid >= 0, 'member must exist in characters list');
-        const before = await session.chat.length();
-        const r = await session.generation.generate({ type: 'normal', forceCharacterId: chid, timeout: 240_000 });
-        assert.equal(r.ok, true,
-            `generation not ok: outcome=${r.outcome} timedOut=${r.timedOut} settledEmpty=${r.settledEmpty} lastMes=${JSON.stringify(r.lastMessage?.mes?.slice(0, 120))}`);
-        // strict guard: a NEW message must exist (a silent no-LLM generation
-        // would leave the chat unchanged and still report ok)
-        assert.ok(r.chatLength > before, `expected a new message, chat went ${before} -> ${r.chatLength}`);
-        const last = await session.chat.last();
-        assert.equal(last.name, chars[1].name, `expected ${chars[1].name} to reply, got ${last.name}`);
-        assert.ok(last.mes.length > 0, 'reply must be non-empty');
+        // Retried on transient provider failures only (empty/aborted deepseek
+        // replies - see helpers.withLiveGenRetry); `before` is re-captured per
+        // attempt. Structural assertions (which member replied) are not retried.
+        await withLiveGenRetry(async () => {
+            const before = await session.chat.length();
+            const r = await session.generation.generate({ type: 'normal', forceCharacterId: chid, timeout: 240_000 });
+            assert.equal(r.ok, true,
+                `generation not ok: outcome=${r.outcome} timedOut=${r.timedOut} settledEmpty=${r.settledEmpty} lastMes=${JSON.stringify(r.lastMessage?.mes?.slice(0, 120))}`);
+            // strict guard: a NEW message must exist (a silent no-LLM generation
+            // would leave the chat unchanged and still report ok)
+            assert.ok(r.chatLength > before, `expected a new message, chat went ${before} -> ${r.chatLength}`);
+            const last = await session.chat.last();
+            assert.equal(last.name, chars[1].name, `expected ${chars[1].name} to reply, got ${last.name}`);
+            assert.ok(last.mes.length > 0, 'reply must be non-empty');
+        });
     });
 });

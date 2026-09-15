@@ -1,7 +1,7 @@
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { UiSession } from '../../src/ui/session.js';
-import { newClient, fixtureName, tinyPng, LIVE_GEN } from '../helpers.js';
+import { newClient, fixtureName, tinyPng, LIVE_GEN, withLiveGenRetry } from '../helpers.js';
 
 // Live integration tests for the UI chat controller.
 // Fixtures: one throwaway character created over HTTP; all chats happen on it.
@@ -317,25 +317,31 @@ describe('ChatControl: chat lifecycle', { timeout: TEST_TIMEOUT }, () => {
 
 describe('GenerationControl (live LLM, gated by ST_DRIVER_LIVE_GEN)', { timeout: TEST_TIMEOUT }, () => {
     test('sendAndGenerate adds the user turn AND a new character reply', { skip: !LIVE_GEN && 'set ST_DRIVER_LIVE_GEN=1 to enable' }, async () => {
-        await openFixtureChat();
-        await session.chat.newChat();
-        const greetingCount = await session.chat.length();
-        const marker = `say-pong-${Date.now()}`;
-        const r = await session.generation.sendAndGenerate(`Reply with exactly: PONG. (${marker})`, { timeout: 240_000 });
-        assert.equal(r.ok, true,
-            `generation not ok: outcome=${r.outcome} timedOut=${r.timedOut} settledEmpty=${r.settledEmpty} lastMes=${JSON.stringify(r.lastMessage?.mes?.slice(0, 120))}`);
+        // Retried on TRANSIENT provider failures only (empty deepseek content /
+        // aborted socket - see withLiveGenRetry). Each attempt starts from a
+        // fresh chat so a retry never builds on a half-written one. Structural
+        // assertions below are NOT retryable: they indicate a driver bug.
+        await withLiveGenRetry(async () => {
+            await openFixtureChat();
+            await session.chat.newChat();
+            const greetingCount = await session.chat.length();
+            const marker = `say-pong-${Date.now()}`;
+            const r = await session.generation.sendAndGenerate(`Reply with exactly: PONG. (${marker})`, { timeout: 240_000 });
+            assert.equal(r.ok, true,
+                `generation not ok: outcome=${r.outcome} timedOut=${r.timedOut} settledEmpty=${r.settledEmpty} lastMes=${JSON.stringify(r.lastMessage?.mes?.slice(0, 120))}`);
 
-        // the user turn must actually be in the chat (regression: merely filling
-        // #send_textarea does NOT add a message in a headless session)
-        const msgs = await session.chat.read({ includeSystem: true });
-        assert.ok(msgs.some(m => m.is_user && m.mes.includes(marker)), 'the user message must be persisted in the chat');
+            // the user turn must actually be in the chat (regression: merely filling
+            // #send_textarea does NOT add a message in a headless session)
+            const msgs = await session.chat.read({ includeSystem: true });
+            assert.ok(msgs.some(m => m.is_user && m.mes.includes(marker)), 'the user message must be persisted in the chat');
 
-        // a NEW character message must exist beyond greeting + user turn
-        assert.ok(r.chatLength >= greetingCount + 2, `expected greeting+user+reply, got ${r.chatLength} (was ${greetingCount})`);
-        const last = await session.chat.last();
-        assert.equal(last.is_user, false, 'the last message must be the character reply');
-        assert.ok(last.mes.length > 0, 'reply must be non-empty');
-        assert.ok(!last.mes.includes('Hello from the fixture'), 'reply must NOT be the greeting (regression guard: silent no-LLM generation)');
+            // a NEW character message must exist beyond greeting + user turn
+            assert.ok(r.chatLength >= greetingCount + 2, `expected greeting+user+reply, got ${r.chatLength} (was ${greetingCount})`);
+            const last = await session.chat.last();
+            assert.equal(last.is_user, false, 'the last message must be the character reply');
+            assert.ok(last.mes.length > 0, 'reply must be non-empty');
+            assert.ok(!last.mes.includes('Hello from the fixture'), 'reply must NOT be the greeting (regression guard: silent no-LLM generation)');
+        });
     });
 
     test('generation actually issues an LLM request (no silent skip)', { skip: !LIVE_GEN && 'set ST_DRIVER_LIVE_GEN=1 to enable' }, async () => {
@@ -345,11 +351,16 @@ describe('GenerationControl (live LLM, gated by ST_DRIVER_LIVE_GEN)', { timeout:
     });
 
     test('quiet generation does not touch the chat', { skip: !LIVE_GEN && 'set ST_DRIVER_LIVE_GEN=1 to enable' }, async () => {
-        const before = await session.chat.length();
-        const text = await session.generation.gen('Reply with exactly one word: QUIET');
-        assert.equal(typeof text, 'string');
-        assert.ok(text.length > 0, 'gen must return generated text');
-        const after = await session.chat.length();
-        assert.equal(after, before, 'chat length must not change');
+        // `text.length > 0` is retryable: /gen's catch returns '' when deepseek
+        // aborts a long non-streaming request (observed live: AbortError in the
+        // ST log, green on immediate rerun). The chat-untouched assertion is not.
+        await withLiveGenRetry(async () => {
+            const before = await session.chat.length();
+            const text = await session.generation.gen('Reply with exactly one word: QUIET');
+            assert.equal(typeof text, 'string');
+            assert.ok(text.length > 0, 'gen must return generated text');
+            const after = await session.chat.length();
+            assert.equal(after, before, 'chat length must not change');
+        });
     });
 });

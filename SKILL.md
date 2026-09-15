@@ -315,6 +315,16 @@ returns the module namespace — then `new mod.FilesApi(st.client)`.
     until `isGenerating()` is false AND the chat snapshot is stable across two rounds.
     If you read messages right after any generation, poll for non-empty text rather than
     assuming one read is final.
+18. **The LLM provider transiently returns EMPTY content, and ST does not error.**
+    Observed live with deepseek (reasoning model, `thinking:enabled`): a completed
+    non-streaming request can come back with `content: ''` + `finish_reason: 'stop'`
+    (all output went into `reasoning_content`), and long requests occasionally die with
+    a socket `AbortError` — `/gen` then catches and returns `''`. Generation therefore
+    reports `ok:false, settledEmpty:true` (correctly — see #17) or yields an empty pipe
+    with no exception. Treat an empty reply as RETRYABLE at the application level, not
+    as a driver bug; the driver's own live tests wrap generation assertions in
+    `withLiveGenRetry` (tests/helpers.js), which retries ONLY empty/abort signatures
+    and lets structural assertion failures through immediately.
 
 ## Testing
 
