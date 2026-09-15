@@ -1,7 +1,7 @@
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { createStDriver, createUiDriver } from '../../src/index.js';
-import { fixtureName, LIVE_GEN } from '../helpers.js';
+import { fixtureName, LIVE_GEN, purgeFixtures } from '../helpers.js';
 
 /**
  * End-to-end workflow tests spanning BOTH tracks:
@@ -83,6 +83,13 @@ after(async () => {
             const worldinfo = await st.loadApi('worldinfo').catch(() => null);
             await worldinfo?.delete(bookName).catch(() => {});
         }
+        // This test opens the fixture card (chat.openCharacterByName), which sets
+        // active_character. state.restore cannot CLEAR it - it only selects a
+        // character when savedState.characterId was set, and here nothing was open
+        // beforehand. Deleting the card does not touch settings.json either, so
+        // without this the run leaves active_character pointing at a deleted file
+        // (observed live). purgeFixtures clears fixture-valued pointers only.
+        if (st) await purgeFixtures(st.client).catch(() => {});
         await st?.close();
     }
 });

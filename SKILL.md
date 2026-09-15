@@ -212,12 +212,21 @@ Safety rules — read these before running with `confirm:true`:
   default — stale pointers are harmless and guessing at user settings is not.
 - Failures are collected in `failures`, never thrown, so one undeletable item does not
   abort the rest. Check `failures` is empty; a non-empty list means partial deletion.
-- Deleting is **irreversible**. `POST /api/characters/delete` is a plain `unlink`; there
-  is no trash. ST has **no on-demand backup endpoint** (`/api/backups/chat/*` only
-  lists/deletes/downloads the chat backups ST makes automatically), so if you need a
-  safety net, take one yourself before cleaning: copy the instance's
-  `data/default-user` directory, or export the cards you care about with
-  `api characters.export` / `api worldinfo.get`.
+- Deleting is **irreversible**: `POST /api/characters/delete` is a plain `unlink` and
+  there is no trash. But it is NOT true that "nothing is recoverable" — check before
+  you say that. ST keeps **automatic** chat backups in `data/default-user/backups/`
+  (`chat_<name>_<timestamp>.jsonl`, rolling, ~50 per chat), which survive `clean`.
+  Verified live: after wiping a group chat holding ~27k words, all 51 of its rolling
+  backups were still on disk. The newest backup's byte size exactly matched the file
+  that had been deleted, and it parsed to the same 33 entries / same speakers; two
+  adjacent backups were message-for-message identical in body text (33 bytes apart in
+  metadata). Note the limit of that evidence: the deleted original is gone, so this
+  establishes "a backup of the same size and content shape survived", not a diff
+  against the original. What has
+  **no** automatic backup is character cards, world info and groups — those are gone
+  for good. ST exposes no on-demand backup endpoint (`/api/backups/chat/*` is
+  list/delete/download only), so for cards and books make your own copy first:
+  `api characters.export` / `api worldinfo.get`, or copy `data/default-user`.
 
 ## Module map
 

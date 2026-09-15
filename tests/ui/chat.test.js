@@ -1,7 +1,7 @@
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { UiSession } from '../../src/ui/session.js';
-import { newClient, fixtureName, tinyPng, LIVE_GEN, withLiveGenRetry } from '../helpers.js';
+import { newClient, fixtureName, tinyPng, LIVE_GEN, withLiveGenRetry, purgeFixtures } from '../helpers.js';
 
 // Live integration tests for the UI chat controller.
 // Fixtures: one throwaway character created over HTTP; all chats happen on it.
@@ -44,6 +44,9 @@ after(async () => {
         if (client && fixtureChar) {
             await client.post('/api/characters/delete', { avatar_url: fixtureChar.avatar, delete_chats: true }).catch(() => {});
         }
+        // Deleting the card leaves a dangling tag_map key (and possibly
+        // active_character) behind; purgeFixtures clears fixture-valued pointers.
+        if (client) await purgeFixtures(client).catch(() => {});
         await client?.close();
     }
 });

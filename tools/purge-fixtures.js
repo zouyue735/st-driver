@@ -130,6 +130,40 @@ if ('__drvtest_marker' in settings) {
     report.settingsMarker = true;
     if (!DRY) { delete settings.__drvtest_marker; settingsDirty = true; }
 }
+
+// Dangling pointers left by tests that OPENED a fixture card or group. Deleting
+// the card does not clear settings.json, so a run ends with active_character
+// pointing at a file that no longer exists. Only fixture-valued pointers and
+// fixture-prefixed tag_map keys are touched - real content is never rewritten.
+const isFixtureRef = (v) => {
+    const s = String(v ?? '');
+    return s.startsWith(PREFIX) || /drvtest/i.test(s);
+};
+if (isFixtureRef(settings.active_character)) {
+    report.danglingActiveCharacter = settings.active_character;
+    if (!DRY) { settings.active_character = null; settingsDirty = true; }
+}
+if (settings.active_group && typeof settings.active_group === 'object') {
+    const dangling = Object.keys(settings.active_group).filter(isFixtureRef);
+    if (dangling.length) {
+        report.danglingActiveGroup = dangling;
+        if (!DRY) {
+            for (const k of dangling) delete settings.active_group[k];
+            settingsDirty = true;
+        }
+    }
+}
+if (settings.tag_map && typeof settings.tag_map === 'object') {
+    const dangling = Object.keys(settings.tag_map).filter(isFixtureRef);
+    if (dangling.length) {
+        report.danglingTagMapKeys = dangling.length;
+        if (!DRY) {
+            for (const k of dangling) delete settings.tag_map[k];
+            settingsDirty = true;
+        }
+    }
+}
+
 if (settingsDirty) {
     await client.post('/api/settings/save', settings);
 }

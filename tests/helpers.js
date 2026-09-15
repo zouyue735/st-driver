@@ -181,5 +181,48 @@ export async function purgeFixtures(client) {
         }
     } catch { /* ignore */ }
 
+    // Dangling settings pointers. Tests that OPEN a fixture card/group set
+    // active_character / active_group, and deleting the card does not clear them,
+    // so every run used to leave active_character pointing at a file that no
+    // longer exists (observed live after a full regression). Only fixture-valued
+    // pointers and fixture-prefixed tag_map keys are touched: settings.json also
+    // holds thousands of tag_map keys for the user's REAL cards, which must
+    // survive - pruning by "card no longer exists" would delete all of them on a
+    // test instance whose cards were never copied over.
+    try {
+        const env = await client.post('/api/settings/get', {});
+        const settings = JSON.parse(env.settings);
+        const isFixtureRef = (v) => String(v ?? '').startsWith(FIXTURE_PREFIX);
+        let dirty = false;
+
+        if (isFixtureRef(settings.active_character)) {
+            results.danglingActiveCharacter = settings.active_character;
+            settings.active_character = null;
+            dirty = true;
+        }
+        if (settings.active_group && typeof settings.active_group === 'object') {
+            const keys = Object.keys(settings.active_group).filter(isFixtureRef);
+            if (keys.length) {
+                results.danglingActiveGroup = keys;
+                for (const k of keys) delete settings.active_group[k];
+                dirty = true;
+            }
+        }
+        if (settings.tag_map && typeof settings.tag_map === 'object') {
+            const keys = Object.keys(settings.tag_map).filter(isFixtureRef);
+            if (keys.length) {
+                results.danglingTagMapKeys = keys.length;
+                for (const k of keys) delete settings.tag_map[k];
+                dirty = true;
+            }
+        }
+        if ('__drvtest_marker' in settings) {
+            results.settingsMarker = true;
+            delete settings.__drvtest_marker;
+            dirty = true;
+        }
+        if (dirty) await client.post('/api/settings/save', settings);
+    } catch { /* ignore - HTTP coverage above is unaffected */ }
+
     return results;
 }

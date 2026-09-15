@@ -1,7 +1,7 @@
 import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { UiSession } from '../../src/ui/session.js';
-import { newClient, fixtureName, LIVE_GEN, withLiveGenRetry } from '../helpers.js';
+import { newClient, fixtureName, LIVE_GEN, withLiveGenRetry, purgeFixtures } from '../helpers.js';
 
 // Live integration tests for GroupControl (frontend group-chat operations).
 // Fixtures: two throwaway characters + one throwaway group, all HTTP-created
@@ -57,6 +57,8 @@ after(async () => {
             for (const c of chars ?? []) {
                 await client.post('/api/characters/delete', { avatar_url: c.avatar, delete_chats: true }).catch(() => {});
             }
+            // Member cards leave dangling tag_map keys behind; purge them.
+            await purgeFixtures(client).catch(() => {});
         }
         await client?.close();
     }
