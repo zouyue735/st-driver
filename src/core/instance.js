@@ -105,6 +105,11 @@ export class InstanceManager {
         return path.join(this.logDir, `${env}.pid`);
     }
 
+    /** @param {string} env @returns {string} runtime state file path */
+    stateFile(env) {
+        return path.join(this.logDir, `${env}.state.json`);
+    }
+
     /**
      * Read the recorded PID for an environment.
      * @param {string} env
@@ -116,6 +121,61 @@ export class InstanceManager {
         const raw = fs.readFileSync(file, 'utf8').trim();
         const pid = Number(raw);
         return Number.isInteger(pid) && pid > 0 ? pid : null;
+    }
+
+    /**
+     * Persist what we actually launched: pid, the EFFECTIVE port, log file and
+     * start time.
+     *
+     * Why a separate state file: `status()` used to infer the port from
+     * config.yaml, which is wrong when an instance is started with a `--port`
+     * override - `instance list` then reported the wrong port and a false
+     * `portOwnerMatches:false` for a perfectly healthy instance. Recording the
+     * effective values at launch keeps status honest.
+     *
+     * @param {string} env
+     * @param {{pid:number, port:number, logFile:string, root:string, startedAt:string}} state
+     */
+    #writeState(env, state) {
+        fs.mkdirSync(this.logDir, { recursive: true });
+        fs.writeFileSync(this.stateFile(env), JSON.stringify(state, null, 2), 'utf8');
+    }
+
+    /**
+     * Read the recorded launch state, or null.
+     * @param {string} env
+     * @returns {{pid:number, port:number, logFile:string, root:string, startedAt:string}|null}
+     */
+    readState(env) {
+        const file = this.stateFile(env);
+        if (!fs.existsSync(file)) return null;
+        try {
+            return JSON.parse(fs.readFileSync(file, 'utf8'));
+        } catch {
+            return null;
+        }
+    }
+
+    /** Remove both the pid file and the state file for an env. */
+    #clearState(env) {
+        fs.rmSync(this.pidFile(env), { force: true });
+        fs.rmSync(this.stateFile(env), { force: true });
+    }
+
+    /**
+     * Record a PID, creating the log directory first.
+     *
+     * `logs/` is normally created by start(), but `stop({adoptPortOwner:true})`
+     * also needs to persist an adopted pid - and it can run before any start()
+     * ever happened (e.g. adopting a manually launched server). Without this the
+     * writeFileSync fails with ENOENT. Routing every pid write through here
+     * removes that call-order dependency.
+     * @param {string} env
+     * @param {number} pid
+     */
+    #writePid(env, pid) {
+        fs.mkdirSync(this.logDir, { recursive: true });
+        fs.writeFileSync(this.pidFile(env), String(pid), 'utf8');
     }
 
     /**
@@ -155,26 +215,42 @@ export class InstanceManager {
     /**
      * Full status of one environment.
      *
-     * The probed port comes from that instance's own config.yaml (falling back to
-     * 8000), and `portOwnerMatches` tells you whether the process actually
-     * holding that port is THIS env's recorded pid. That distinction matters
-     * because test and prod both default to port 8000: a probe of localhost:8000
-     * alone cannot say which instance answered.
+     * Port resolution order: explicit `options.port` > the port recorded when the
+     * instance was launched (state file) > the instance's config.yaml > 8000.
+     * Using the recorded launch port is what makes `--port` overrides visible;
+     * inferring from config.yaml alone reported the wrong port for an instance
+     * started with an override.
+     *
+     * `portOwnerMatches` tells you whether the process actually holding that port
+     * IS this env's recorded pid - important because test and prod both default
+     * to 8000, so a bare probe cannot say which instance answered.
      *
      * @param {string} env
      * @param {object} [options]
-     * @param {number} [options.port] port to probe (default: from config.yaml, else 8000)
-     * @returns {Promise<object>} {env, root, pid, running, http, port, portOwnerPid,
-     *   portOwnerMatches, logFile, exists, hasServerJs, hasNodeModules, hasConfig}
+     * @param {number} [options.port] force the port to probe
+     * @returns {Promise<object>} {env, root, pid, running, http, port, portSource,
+     *   portOwnerPid, portOwnerMatches, startedAt, startedAtSource, logFile,
+     *   exists, hasServerJs, hasNodeModules, hasConfig}
      */
     async status(env, options = {}) {
         const root = this.resolveRoot(env);
-        const port = options.port ?? await this.#detectPort(root) ?? 8000;
+        const state = this.readState(env);
         const pid = this.readPid(env);
         const running = pid !== null && this.isPidAlive(pid);
+        // A recorded port is only meaningful while that pid is alive; otherwise a
+        // stale state file from a dead launch would mislead us.
+        const port = options.port
+            ?? (running && state?.port ? state.port : null)
+            ?? await this.#detectPort(root)
+            ?? 8000;
+        const portSource = options.port
+            ? 'option'
+            : (running && state?.port ? 'state' : 'config-or-default');
         const http = await this.probe(`http://localhost:${port}`);
         // Who actually holds the port, and is it us? (Windows only; null elsewhere)
         const portOwnerPid = this.#findPidOnPort(port);
+        const logFile = this.latestLog(env);
+        const startedAt = running ? (state?.startedAt ?? this.#startedAtFromLogName(logFile)) : null;
         return {
             env,
             root,
@@ -182,10 +258,16 @@ export class InstanceManager {
             running,
             http,
             port,
+            portSource,
             portOwnerPid,
             // true only when the live port owner IS this env's recorded pid
             portOwnerMatches: portOwnerPid !== null && pid !== null && portOwnerPid === pid,
-            logFile: this.latestLog(env),
+            startedAt,
+            // 'state' = recorded at launch; 'log-name' = recovered from the log
+            // file name, so a second-resolution value parsed out of the file name
+            // is never mistaken for a recorded one.
+            startedAtSource: !running ? null : (state?.startedAt ? 'state' : (startedAt ? 'log-name' : null)),
+            logFile,
             exists: fs.existsSync(root),
             hasServerJs: fs.existsSync(path.join(root, 'server.js')),
             hasNodeModules: fs.existsSync(path.join(root, 'node_modules')),
@@ -222,9 +304,42 @@ export class InstanceManager {
         const prefix = `st-${env}-`;
         const candidates = fs.readdirSync(this.logDir)
             .filter(f => f.startsWith(prefix) && f.endsWith('.log'))
-            .map(f => ({ f, m: fs.statSync(path.join(this.logDir, f)).mtimeMs }))
-            .sort((a, b) => b.m - a.m);
+            .map(f => ({
+                f,
+                // Sort by the launch timestamp embedded in the FILE NAME, not by
+                // mtime: the name is written at spawn time so it is authoritative
+                // about which launch is newest, while mtime is identical for files
+                // created in the same tick (making the old sort order arbitrary)
+                // and moves every time a running server appends output.
+                stamp: /^st-.+?-(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.log$/.exec(f)?.[1] ?? '',
+                m: fs.statSync(path.join(this.logDir, f)).mtimeMs,
+            }))
+            .sort((a, b) => (b.stamp.localeCompare(a.stamp)) || (b.m - a.m));
         return candidates.length ? path.join(this.logDir, candidates[0].f) : null;
+    }
+
+    /**
+     * Recover the launch time from a log file NAME (`st-<env>-YYYY-MM-DD_HH-mm-ss.log`).
+     *
+     * status() reports startedAt from the state file, but a state file only exists
+     * for launches this manager recorded - an instance started before that field
+     * existed (or launched by hand) reports null even though the log plainly
+     * carries the time. Parsing it back out of the file name keeps status honest
+     * without reading file contents.
+     *
+     * @param {string|null} logFile absolute path from latestLog()
+     * @returns {string|null} 'YYYY-MM-DD HH:mm:ss' or null when it cannot be parsed
+     */
+    #startedAtFromLogName(logFile) {
+        if (!logFile) return null;
+        const base = path.basename(logFile);
+        if (!base.startsWith('st-')) return null;
+        // Anchor on the trailing timestamp rather than parsing the env name out of
+        // it: `env` may be an arbitrary directory path containing '-' (and ':'),
+        // so `st-<env>-` is not a fixed-width prefix.
+        const m = /(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})\.log$/.exec(base);
+        if (!m) return null;
+        return `${m[1]} ${m[2].replace(/-/g, ':')}`;
     }
 
     /**
@@ -242,7 +357,9 @@ export class InstanceManager {
      * @param {number} [options.waitTimeout=60000] ms to wait for readiness
      * @param {Record<string,string>} [options.env] extra environment variables
      * @returns {Promise<{env:string, root:string, pid:number, logFile:string, port:number,
-     *   ready:boolean, probe:object, startedAt:string}>}
+     *   ready:boolean, probe:object, startedAt:string, readyAt:string|null}>}
+     *   `startedAt` is the spawn time (matches the log file name and banner);
+     *   `readyAt` is when the HTTP endpoint answered, or null when wait=false
      * @throws {InstanceError} pre-flight failure, already running (without force), or boot timeout
      */
     async start(env, options = {}) {
@@ -279,6 +396,10 @@ export class InstanceManager {
 
         fs.mkdirSync(this.logDir, { recursive: true });
         const startedAt = timestamp();
+        // Captured ONCE, before spawn: the banner and the returned startedAt must
+        // agree with the log file name. (Taking this after the readiness wait
+        // reported the READY time as the START time, several seconds later.)
+        const startedAtIso = isoNow();
         const logFile = path.join(this.logDir, `st-${env}-${startedAt}.log`);
 
         const args = ['server.js'];
@@ -299,7 +420,7 @@ export class InstanceManager {
         const fd = fs.openSync(logFile, 'a');
         fs.writeSync(fd,
             `=== st-driver instance start ===\n` +
-            `time:      ${isoNow()}\n` +
+            `time:      ${startedAtIso}\n` +
             `env:       ${env}\n` +
             `root:      ${root}\n` +
             `command:   node ${args.join(' ')}\n` +
@@ -324,7 +445,16 @@ export class InstanceManager {
         // Log the pid through the same fd, then close our copy. The child
         // inherited its own handle and keeps appending after we close ours.
         fs.writeSync(fd, `pid: ${child.pid}\n\n`);
-        fs.writeFileSync(this.pidFile(env), String(child.pid), 'utf8');
+        this.#writePid(env, child.pid);
+        // Record the EFFECTIVE launch parameters so status()/list report the real
+        // port (config.yaml cannot express a --port override).
+        this.#writeState(env, {
+            pid: child.pid,
+            port,
+            logFile,
+            root,
+            startedAt: startedAtIso,
+        });
         fs.closeSync(fd);
 
         const exitedEarly = await new Promise((resolve) => {
@@ -338,7 +468,7 @@ export class InstanceManager {
 
         if (exitedEarly) {
             fs.appendFileSync(logFile, `\n=== process exited early: ${JSON.stringify(exitedEarly)} ===\n`);
-            fs.rmSync(this.pidFile(env), { force: true });
+            this.#clearState(env);
             throw new InstanceError(
                 `instance '${env}' exited immediately (code=${exitedEarly.code} signal=${exitedEarly.signal}${exitedEarly.error ? ` error=${exitedEarly.error}` : ''}); ` +
                 `see ${logFile}`,
@@ -349,6 +479,7 @@ export class InstanceManager {
         child.unref();
 
         let ready = false;
+        let readyAt = null;
         let probe = { up: false, error: 'not probed' };
         if (options.wait !== false) {
             const deadline = Date.now() + (options.waitTimeout ?? 60_000);
@@ -360,7 +491,7 @@ export class InstanceManager {
                     );
                 }
                 probe = await this.probe(`http://localhost:${port}`, 2000);
-                if (probe.up) { ready = true; break; }
+                if (probe.up) { ready = true; readyAt = isoNow(); break; }
                 await new Promise(r => setTimeout(r, 500));
             }
             if (!ready) {
@@ -374,7 +505,8 @@ export class InstanceManager {
 
         return {
             env, root, pid: child.pid, logFile, port, ready, probe,
-            startedAt: isoNow(),
+            startedAt: startedAtIso,
+            readyAt,
         };
     }
 
@@ -417,10 +549,19 @@ export class InstanceManager {
                 return { env, root, pid: null, stopped: false, method: `no-pid-file; nothing on port ${port}` };
             }
             pid = owner;
-            fs.writeFileSync(this.pidFile(env), String(pid), 'utf8');
+            // Adopt it: record pid + the port we found it on so status() agrees
+            // while the stop is in flight.
+            this.#writePid(env, pid);
+            this.#writeState(env, {
+                pid,
+                port,
+                logFile: this.latestLog(env),
+                root,
+                startedAt: null,   // unknown - not started by this manager
+            });
         }
         if (!this.isPidAlive(pid)) {
-            fs.rmSync(this.pidFile(env), { force: true });
+            this.#clearState(env);
             return { env, root, pid, stopped: false, method: 'already-dead (stale pid file removed)' };
         }
 
@@ -432,7 +573,7 @@ export class InstanceManager {
             const deadline = Date.now() + gracefulTimeout;
             while (Date.now() < deadline) {
                 if (!this.isPidAlive(pid)) {
-                    fs.rmSync(this.pidFile(env), { force: true });
+                    this.#clearState(env);
                     return { env, root, pid, stopped: true, method: 'SIGTERM' };
                 }
                 await new Promise(r => setTimeout(r, 250));
@@ -446,7 +587,7 @@ export class InstanceManager {
             if (!this.isPidAlive(pid)) break;
             await new Promise(r => setTimeout(r, 200));
         }
-        fs.rmSync(this.pidFile(env), { force: true });
+        this.#clearState(env);
         const stillAlive = this.isPidAlive(pid);
         return {
             env, root, pid, stopped: !stillAlive,
@@ -456,19 +597,62 @@ export class InstanceManager {
 
     /**
      * Restart = stop (if running) then start.
+     *
+     * An explicit `options.port` wins; otherwise the port the instance was last
+     * launched on is carried over. That matters for `--port` overrides: stop()
+     * clears the state file, so without capturing the port first, restarting an
+     * instance that was running on 8001 would silently fall back to the
+     * config.yaml port (8000) and collide with the other environment.
+     *
      * @param {string} env
      * @param {object} [options] forwarded to start()
-     * @returns {Promise<object>} start() result plus `stoppedFirst`
+     * @returns {Promise<object>} start() result plus `stoppedFirst`, `carriedPort`
      */
     async restart(env, options = {}) {
+        const root = this.resolveRoot(env);
         const pid = this.readPid(env);
+        const wasRunning = pid !== null && this.isPidAlive(pid);
+
+        // Capture the effective port BEFORE stop() wipes the state file.
+        const recordedPort = this.readState(env)?.port ?? null;
+        const carriedPort = options.port ?? recordedPort ?? null;
+
+        // Resolve the port we WILL start on, then verify it is usable BEFORE
+        // killing anything. A restart that stops first and only then discovers
+        // the port is taken leaves the user with nothing running - so fail fast
+        // here instead.
+        const targetPort = carriedPort ?? await this.#detectPort(root) ?? 8000;
+        const holder = this.#findPidOnPort(targetPort);
+        // The current instance holding the port is fine (we're about to stop it);
+        // any OTHER holder means the restart cannot proceed.
+        if (holder !== null && holder !== pid) {
+            throw new InstanceError(
+                `restart aborted for '${env}': port ${targetPort} is held by pid ${holder}, ` +
+                `which is not this instance (pid ${pid ?? 'none'}); nothing was stopped. ` +
+                `Pass port:${targetPort === 8000 ? '8001' : targetPort + 1} or free that port first`,
+                { env, port: targetPort, holder, pid },
+            );
+        }
+
+        // Also reject a missing dependency BEFORE destroying the running instance.
+        const { ok, missing } = this.#preflight(root);
+        if (!ok) {
+            throw new InstanceError(
+                `restart aborted for '${env}' (nothing was stopped): ${missing.join('; ')}`,
+                { missing },
+            );
+        }
+
         let stoppedFirst = false;
-        if (pid !== null && this.isPidAlive(pid)) {
+        if (wasRunning) {
             await this.stop(env, { gracefulTimeout: options.gracefulTimeout ?? 8000 });
             stoppedFirst = true;
         }
-        const result = await this.start(env, { ...options, force: false });
-        return { ...result, stoppedFirst };
+
+        // We know the port explicitly now, so always pass it through (otherwise
+        // start() would re-derive it and could land somewhere else).
+        const result = await this.start(env, { ...options, port: targetPort, force: false });
+        return { ...result, stoppedFirst, carriedPort: targetPort };
     }
 
     /**
@@ -484,6 +668,10 @@ export class InstanceManager {
         if (!logFile || !fs.existsSync(logFile)) return { logFile: null, lines: [] };
         const count = options.lines ?? 40;
         const all = fs.readFileSync(logFile, 'utf8').split(/\r?\n/);
+        // A file ending in '\n' splits to a trailing '' element; drop exactly one
+        // such artifact so `lines:N` returns N REAL lines rather than N-1 plus an
+        // empty string.
+        if (all.length && all[all.length - 1] === '') all.pop();
         return { logFile, lines: all.slice(Math.max(0, all.length - count)) };
     }
 
@@ -498,10 +686,25 @@ export class InstanceManager {
             .filter(f => f.endsWith('.log'))
             .map(f => {
                 const m = f.match(/^st-(.+?)-(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.log$/);
-                return { file: path.join(this.logDir, f), env: m?.[1] ?? null, startedAt: m?.[2] ?? null, ...fs.statSync(path.join(this.logDir, f)) };
+                // Read the fields off the Stats object directly. Spreading
+                // `...fs.statSync()` does NOT carry `mtime`/`size` reliably: in
+                // modern Node those live on the prototype as getters, so the
+                // spread yielded {} and the old `e.mtime.toISOString()` threw on
+                // EVERY call. mtimeMs is a plain own property, so use that.
+                const st = fs.statSync(path.join(this.logDir, f));
+                return {
+                    file: path.join(this.logDir, f),
+                    env: m?.[1] ?? null,
+                    startedAt: m?.[2] ?? null,
+                    size: st.size,
+                    mtimeMs: st.mtimeMs,
+                };
             })
             .filter(e => !env || e.env === env)
-            .map(e => ({ file: e.file, env: e.env, startedAt: e.startedAt, size: e.size, mtime: e.mtime.toISOString() }))
+            .map(e => ({
+                file: e.file, env: e.env, startedAt: e.startedAt, size: e.size,
+                mtime: new Date(e.mtimeMs).toISOString(),
+            }))
             .sort((a, b) => (a.mtime < b.mtime ? 1 : -1));
     }
 

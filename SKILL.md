@@ -142,7 +142,12 @@ Behavior worth knowing before you use it:
 
 - **Logs**: each start writes `<skill>/logs/st-<env>-<YYYY-MM-DD_HH-mm-ss>.log`
   with a banner (time, root, full command, port, node version), then merged
-  stdout+stderr. `logs/<env>.pid` records the pid. `logs/` is gitignored.
+  stdout+stderr. `logs/<env>.pid` records the pid; `logs/<env>.state.json` records
+  the effective launch parameters (pid, port, log file, start time) so `status`
+  reports `--port` overrides correctly. `logs/` is gitignored.
+- **`startedAtSource`** tells you where `status.startedAt` came from: `'state'`
+  (recorded at launch) or `'log-name'` (parsed back out of the log file name for
+  instances launched before state files existed). Both are local-time strings.
 - **Detached**: the server survives the CLI process exiting.
 - **Both envs default to port 8000**, so they cannot run simultaneously unless
   one is given `--json '{"port":N}'`.
